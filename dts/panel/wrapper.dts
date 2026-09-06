@@ -1,0 +1,30 @@
+/dts-v1/;
+
+/*
+ * Minimal host tree so dtc can compile the stock Xiaomi panel fragment on its
+ * own. lmdpdg only ever looks at the panel node under a "qcom,mdss_mdp"
+ * compatible parent, so tlmm and the supply entries just have to exist and be
+ * resolvable -- their contents are never read.
+ */
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+
+	tlmm: pinctrl {
+		compatible = "qcom,dummy-tlmm";
+		gpio-controller;
+		#gpio-cells = <2>;
+		phandle-stub;
+	};
+
+	dsi_panel_pwr_supply_o11: panel-supply {
+		compatible = "qcom,dummy-supply";
+	};
+
+	mdss_mdp: mdp {
+		compatible = "qcom,mdss_mdp";
+	};
+};
+
+#include "dsi-panel-o11-42-02-0a-dsc-cmd.dtsi"

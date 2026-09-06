@@ -1,0 +1,19 @@
+&mdss_dsi0 {
+	panel@0 {
+		compatible = "mdss,o11-42-02-0a-dsc";
+		reg = <0>;
+
+		reset-gpios = <&tlmm XY GPIO_ACTIVE_LOW>;
+
+		port {
+			panel_in: endpoint {
+				remote-endpoint = <&mdss_dsi0_out>;
+			};
+		};
+	};
+};
+
+&mdss_dsi0_out {
+	data-lanes = <0 1 2 3>;
+	remote-endpoint = <&panel_in>;
+};

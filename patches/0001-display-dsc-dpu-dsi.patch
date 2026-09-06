@@ -1,0 +1,1697 @@
+diff --git a/drivers/gpu/drm/display/drm_dsc_helper.c b/drivers/gpu/drm/display/drm_dsc_helper.c
+index 05996c526..82fb6d4b7 100644
+--- a/drivers/gpu/drm/display/drm_dsc_helper.c
++++ b/drivers/gpu/drm/display/drm_dsc_helper.c
+@@ -79,6 +79,37 @@ int drm_dsc_dp_rc_buffer_size(u8 rc_buffer_block_size, u8 rc_buffer_size)
+ }
+ EXPORT_SYMBOL(drm_dsc_dp_rc_buffer_size);
+ 
++/*
++ * Whether to double bits_per_pixel when packing pps4/pps5 on a native 4:2:2
++ * link. The vendor stack does (sde_dsc_helper.c:733), and the arithmetic reason
++ * is sound -- the encoder works on half the pixels per line, so each carries
++ * twice the bits -- but on zorn (o11 42 02 0a) turning it on produced a black
++ * panel where leaving it off produces a corrupted picture, so it is not settled
++ * which the panel actually wants. 0 = upstream behaviour.
++ *
++ *	echo 1 > /sys/module/drm_display_helper/parameters/dsc_pps_bpp_double
++ *	echo 1 > /sys/class/graphics/fb0/blank; sleep 2
++ *	echo 0 > /sys/class/graphics/fb0/blank
++ *
++ * The blank cycle is required: the PPS is only sent from the panel's prepare().
++ */
++static bool dsc_pps_bpp_double;
++module_param(dsc_pps_bpp_double, bool, 0600);
++MODULE_PARM_DESC(dsc_pps_bpp_double,
++		 "Double PPS bits_per_pixel on native 4:2:2 (0 = upstream)");
++
++/*
++ * bits_per_pixel as the PPS carries it, which is not always the configured
++ * value: see the comment at PPS 4 in drm_dsc_pps_payload_pack().
++ */
++static u16 drm_dsc_pps_bpp(const struct drm_dsc_config *dsc_cfg)
++{
++	if (dsc_cfg->native_422 && dsc_pps_bpp_double)
++		return dsc_cfg->bits_per_pixel * 2;
++
++	return dsc_cfg->bits_per_pixel;
++}
++
+ /**
+  * drm_dsc_pps_payload_pack() - Populates the DSC PPS
+  *
+@@ -120,8 +151,22 @@ void drm_dsc_pps_payload_pack(struct drm_dsc_picture_parameter_set *pps_payload,
+ 		dsc_cfg->bits_per_component << DSC_PPS_BPC_SHIFT;
+ 
+ 	/* PPS 4 */
++	/*
++	 * bits_per_pixel goes into the PPS doubled when chroma is subsampled: the
++	 * encoder works on half the pixels per line, so each of them carries twice
++	 * the bits. The vendor stack does exactly this before packing pps4/pps5
++	 * (sde_dsc_helper.c: bpp = 2 * bpp for native_422 || native_420).
++	 *
++	 * Without it the panel is told 8.0 bpp for a stream encoded at the 16.0 bpp
++	 * equivalent, so its decoder takes bits at half the rate the encoder put
++	 * them in and every group after the first is garbage -- and no amount of
++	 * fixing the DPU-side registers can change that, because the error is in
++	 * what the panel was told, not in what was sent.
++	 *
++	 * 4:2:0 is left alone: no in-tree user has been verified against hardware.
++	 */
+ 	pps_payload->pps_4 =
+-		((dsc_cfg->bits_per_pixel & DSC_PPS_BPP_HIGH_MASK) >>
++		((drm_dsc_pps_bpp(dsc_cfg) & DSC_PPS_BPP_HIGH_MASK) >>
+ 		 DSC_PPS_MSB_SHIFT) |
+ 		dsc_cfg->vbr_enable << DSC_PPS_VBR_EN_SHIFT |
+ 		dsc_cfg->simple_422 << DSC_PPS_SIMPLE422_SHIFT |
+@@ -130,7 +175,7 @@ void drm_dsc_pps_payload_pack(struct drm_dsc_picture_parameter_set *pps_payload,
+ 
+ 	/* PPS 5 */
+ 	pps_payload->bits_per_pixel_low =
+-		(dsc_cfg->bits_per_pixel & DSC_PPS_LSB_MASK);
++		(drm_dsc_pps_bpp(dsc_cfg) & DSC_PPS_LSB_MASK);
+ 
+ 	/*
+ 	 * The DSC panel expects the PPS packet to have big endian format
+@@ -1319,8 +1364,25 @@ int drm_dsc_compute_rc_parameters(struct drm_dsc_config *vdsc_cfg)
+ 	unsigned long hrd_delay = 0;
+ 	unsigned long final_scale = 0;
+ 	unsigned long rbs_min = 0;
++	unsigned long bpp_eff;
+ 
+-	if (vdsc_cfg->native_420 || vdsc_cfg->native_422) {
++	/*
++	 * With subsampled chroma the encoder works on half the pixels per line at
++	 * twice the bits per pixel, and both halves of that matter:
++	 * groups_per_line follows the halved width, while the chunk size has to
++	 * come out as the full-width byte count. Halving the width without
++	 * doubling bits_per_pixel -- which is what this did for 4:2:2 -- makes the
++	 * stream carry half the bytes per line that its decoder expects.
++	 *
++	 * The vendor stack for this hardware does exactly the pair (sde_dsc_helper.c:
++	 * slice_width_mod = slice_width / 2; bpp = bpp * 2), and its registers
++	 * confirm the result: a 720-wide native 4:2:2 slice at 8 bpp gives
++	 * chunk_size 720 and groups_per_line 120.
++	 *
++	 * 4:2:0 is left as it was: no in-tree user has been checked against
++	 * hardware, and i915 depends on the current behaviour.
++	 */
++	if (vdsc_cfg->native_420) {
+ 		/* Number of groups used to code each line of a slice */
+ 		groups_per_line = DIV_ROUND_UP(vdsc_cfg->slice_width / 2,
+ 					       DSC_RC_PIXELS_PER_GROUP);
+@@ -1329,6 +1391,13 @@ int drm_dsc_compute_rc_parameters(struct drm_dsc_config *vdsc_cfg)
+ 		vdsc_cfg->slice_chunk_size = DIV_ROUND_UP(vdsc_cfg->slice_width / 2 *
+ 							  vdsc_cfg->bits_per_pixel,
+ 							  (8 * 16));
++	} else if (vdsc_cfg->native_422) {
++		groups_per_line = DIV_ROUND_UP(vdsc_cfg->slice_width / 2,
++					       DSC_RC_PIXELS_PER_GROUP);
++
++		vdsc_cfg->slice_chunk_size = DIV_ROUND_UP(vdsc_cfg->slice_width / 2 *
++							  vdsc_cfg->bits_per_pixel * 2,
++							  (8 * 16));
+ 	} else {
+ 		/* Number of groups used to code each line of a slice */
+ 		groups_per_line = DIV_ROUND_UP(vdsc_cfg->slice_width,
+@@ -1369,9 +1438,24 @@ int drm_dsc_compute_rc_parameters(struct drm_dsc_config *vdsc_cfg)
+ 	else
+ 		vdsc_cfg->scale_decrement_interval = DSC_SCALE_DECREMENT_INTERVAL_MAX;
+ 
++	/*
++	 * Same doubling as above: with 4:2:2 each group carries half as many
++	 * pixels, so the encoder's effective bits per pixel is twice the
++	 * configured value. The vendor stack applies it here too --
++	 * sde_dsc_helper.c doubles bpp for native_422/420 and then computes
++	 * final_value = rc_model_size - initial_xmit_delay * bpp + mux_bits.
++	 *
++	 * Without it final_offset comes out too large, and final_scale and
++	 * scale_increment_interval follow it: on a 720-wide 4:2:2 slice at 8 bpp
++	 * with initial_xmit_delay 256, the hardware wants final_offset 4432 and
++	 * scale_increment_interval 163, not 6480 and 66.
++	 */
++	bpp_eff = vdsc_cfg->native_422 ? vdsc_cfg->bits_per_pixel * 2
++				       : vdsc_cfg->bits_per_pixel;
++
+ 	vdsc_cfg->final_offset = vdsc_cfg->rc_model_size -
+-		(vdsc_cfg->initial_xmit_delay *
+-		 vdsc_cfg->bits_per_pixel + 8) / 16 + num_extra_mux_bits;
++		(vdsc_cfg->initial_xmit_delay * bpp_eff + 8) / 16 +
++		num_extra_mux_bits;
+ 
+ 	if (vdsc_cfg->final_offset >= vdsc_cfg->rc_model_size) {
+ 		DRM_DEBUG_KMS("FinalOfs < RcModelSze for this InitialXmitDelay\n");
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/catalog/dpu_10_0_sm8650.h b/drivers/gpu/drm/msm/disp/dpu1/catalog/dpu_10_0_sm8650.h
+index 56d3c38c8..7d95becd6 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/catalog/dpu_10_0_sm8650.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/catalog/dpu_10_0_sm8650.h
+@@ -182,19 +182,19 @@ static const struct dpu_dspp_cfg sm8650_dspp[] = {
+ 	{
+ 		.name = "dspp_0", .id = DSPP_0,
+ 		.base = 0x54000, .len = 0x1800,
+-		.sblk = &sdm845_dspp_sblk,
++		.sblk = &sm8650_dspp_sblk_0,
+ 	}, {
+ 		.name = "dspp_1", .id = DSPP_1,
+ 		.base = 0x56000, .len = 0x1800,
+-		.sblk = &sdm845_dspp_sblk,
++		.sblk = &sm8650_dspp_sblk_1,
+ 	}, {
+ 		.name = "dspp_2", .id = DSPP_2,
+ 		.base = 0x58000, .len = 0x1800,
+-		.sblk = &sdm845_dspp_sblk,
++		.sblk = &sm8650_dspp_sblk_2,
+ 	}, {
+ 		.name = "dspp_3", .id = DSPP_3,
+ 		.base = 0x5a000, .len = 0x1800,
+-		.sblk = &sdm845_dspp_sblk,
++		.sblk = &sm8650_dspp_sblk_3,
+ 	},
+ };
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+index cbb7caa19..19efb500d 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -34,6 +34,15 @@
+ #include "dpu_core_perf.h"
+ #include "dpu_trace.h"
+ 
++/*
++ * Flush the SPR sub-block through the CTL so its shadow registers go active.
++ * See _dpu_crtc_setup_cp_blocks(). Off restores the behaviour where SPR is
++ * programmed but never takes effect.
++ */
++static bool dpu_spr_flush = true;
++module_param_named(spr_flush, dpu_spr_flush, bool, 0600);
++MODULE_PARM_DESC(spr_flush, "CTL-flush the SPR sub-block so its writes go live");
++
+ /* layer mixer index on dpu_crtc */
+ #define LEFT_MIXER 0
+ #define RIGHT_MIXER 1
+@@ -899,6 +908,41 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
+ 			ctl->ops.update_pending_flush_dspp(ctl,
+ 				mixer[i].hw_dspp->idx, DPU_DSPP_GC);
+ 		}
++
++		/*
++		 * SPR is a property of the panel's subpixel layout, not of any
++		 * userspace colour-management state, so it is programmed
++		 * unconditionally rather than from a CRTC property.
++		 *
++		 * Every mixer's DSPP gets the *same* configuration. That is not
++		 * an assumption: SPR_0 and SPR_1 were read out of a running
++		 * Android and are identical, down to the mixer count in +0x08.
++		 *
++		 * Like PCC and GC, the sub-block is double buffered, so the
++		 * writes only go active once the CTL flushes them -- the same
++		 * CTL_DSPP_n_FLUSH bit 8 the vendor sets from its reg_dma path
++		 * (dspp_sub_blk_flush_tbl[SDE_DSPP_SPR]). Without that flush the
++		 * whole SPR window reads back exactly what was written while the
++		 * block's read-only width at +0x10 stays zero, where both the
++		 * bootloader and a running Android report 720 + 720: written,
++		 * shadowed, never active. That is the reason nothing about SPR --
++		 * enabling it, disabling it, correcting its phase offsets --
++		 * changed a single pixel.
++		 *
++		 * An earlier attempt at this flush ended in
++		 * dpu_encoder_phys_cmd_prepare_for_kickoff timing out with
++		 * "failed wait_for_idle ... pp:0" and a black panel. That was
++		 * with the phase offsets one word high and the second mixer's
++		 * window aimed at SPR_2, so it is worth one more try; the
++		 * parameter makes it recoverable over ssh instead of a rebuild.
++		 */
++		if (dspp->ops.setup_spr) {
++			dspp->ops.setup_spr(dspp, true);
++
++			if (dpu_spr_flush && ctl->ops.update_pending_flush_dspp)
++				ctl->ops.update_pending_flush_dspp(ctl, dspp->idx,
++								   DPU_DSPP_SPR);
++		}
+ 	}
+ }
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+index eba1d5221..228a2440e 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -242,6 +242,16 @@ u32 dpu_encoder_get_drm_fmt(struct dpu_encoder_phys *phys_enc)
+ 	if (drm_mode_is_420_only(info, mode))
+ 		return DRM_FORMAT_YUV420;
+ 
++	/*
++	 * A native 4:2:2 DSC stream needs CDM to hand DSC YCbCr with the chroma
++	 * horizontally subsampled. NV16 is the 8-bit 4:2:2 entry in the format
++	 * table (CHROMA_H2V1); only its chroma_sample and bit depth matter here,
++	 * because CDM feeds DSC directly instead of writing to memory, so the
++	 * plane layout the format also describes never comes into play.
++	 */
++	if (dpu_enc->dsc && dpu_enc->dsc->native_422)
++		return DRM_FORMAT_NV16;
++
+ 	return DRM_FORMAT_RGB888;
+ }
+ 
+@@ -653,6 +663,79 @@ struct drm_dsc_config *dpu_encoder_get_dsc_config(struct drm_encoder *drm_enc)
+ 	return NULL;
+ }
+ 
++/*
++ * Whether a native 4:2:2 DSC stream is routed through CDM.
++ *
++ * Off, because the vendor does not do it. On a running Android this SoC reads
++ * CDM_CSC_10_OPMODE = 0x2 (SRC_FMT_YUV with the enable bit clear) and a
++ * downsample block that is all zero, while its DSC runs with native_422 = 1. So
++ * the DSC block does the RGB -> YCbCr conversion and the chroma subsample
++ * itself, and convert_rgb only governs the 4:4:4 RGB -> YCoCg path.
++ *
++ * The CDM path is kept because mainline genuinely never wired CDM to DSI and
++ * another panel may want it -- but turning it on here made this one stop
++ * scanning out altogether, wait_for_idle timing out on every frame.
++ */
++static bool dsc_use_cdm;
++module_param(dsc_use_cdm, bool, 0600);
++MODULE_PARM_DESC(dsc_use_cdm,
++		 "route a native 4:2:2 DSC stream through CDM; off matches what the vendor does");
++
++/*
++ * CDM's colour-space matrix. The block always has its CSC enabled in
++ * dpu_hw_cdm_enable(), so the only way through it without a colour transform is
++ * to hand it an identity matrix: coefficients are S15.16 with 1.0 at 0x200,
++ * biases zero, both clamps full range 0..0x3ff (the 601 limited matrix instead
++ * post-biases by 64/512/512 and clamps to 64..940).
++ *
++ * Identity is the default because CDM is wanted here for its packer, not for a
++ * colour conversion. The vendor sends the panel plain RGB through DSC, so
++ * converting to YCbCr on the way in would be a transform the panel never undoes.
++ * What is missing without CDM is only the interleave.
++ */
++static const struct dpu_csc_cfg dpu_csc10_identity = {
++	{
++		TO_S15D16(0x0200), TO_S15D16(0x0000), TO_S15D16(0x0000),
++		TO_S15D16(0x0000), TO_S15D16(0x0200), TO_S15D16(0x0000),
++		TO_S15D16(0x0000), TO_S15D16(0x0000), TO_S15D16(0x0200)
++	},
++	{ 0x00, 0x00, 0x00 },
++	{ 0x0000, 0x0000, 0x0000 },
++	{ 0x000, 0x3ff, 0x000, 0x3ff, 0x000, 0x3ff },
++	{ 0x000, 0x3ff, 0x000, 0x3ff, 0x000, 0x3ff },
++};
++
++static bool dsc_cdm_csc_601;
++module_param(dsc_cdm_csc_601, bool, 0600);
++MODULE_PARM_DESC(dsc_cdm_csc_601,
++		 "use the RGB->YCbCr 601 limited matrix in CDM instead of identity");
++
++/*
++ * A DSI panel needs CDM only when its DSC stream is native 4:2:2. convert_rgb is
++ * off in that mode, so DSC does no colour transform of its own and the pixels
++ * have to arrive already YCbCr with the chroma horizontally subsampled -- CDM,
++ * between the layer mixer and DSC, is what does that.
++ *
++ * This reads the config instead of using dpu_enc->dsc because the earliest
++ * caller is atomic_mode_set, and dpu_enc->dsc is not filled in until
++ * atomic_enable, one step later.
++ */
++static bool dpu_encoder_dsi_needs_cdm(struct drm_encoder *drm_enc)
++{
++	struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
++	struct drm_dsc_config *dsc;
++
++	if (!dsc_use_cdm)
++		return false;
++
++	if (dpu_enc->disp_info.intf_type != INTF_DSI)
++		return false;
++
++	dsc = dpu_encoder_get_dsc_config(drm_enc);
++
++	return dsc && dsc->native_422;
++}
++
+ void dpu_encoder_update_topology(struct drm_encoder *drm_enc,
+ 				 struct msm_display_topology *topology,
+ 				 struct drm_atomic_state *state,
+@@ -700,9 +783,10 @@ void dpu_encoder_update_topology(struct drm_encoder *drm_enc,
+ 		return;
+ 
+ 	/*
+-	 * Use CDM only for writeback or DP at the moment as other interfaces cannot handle it.
+-	 * If writeback itself cannot handle cdm for some reason it will fail in its atomic_check()
+-	 * earlier.
++	 * CDM is used for writeback, for DP 4:2:0, and for a DSI panel driven as
++	 * DSC native 4:2:2. Any other interface cannot handle it. If writeback
++	 * itself cannot handle cdm for some reason it will fail in its
++	 * atomic_check() earlier.
+ 	 */
+ 	if (disp_info->intf_type == INTF_WB && conn_state->writeback_job) {
+ 		fb = conn_state->writeback_job->fb;
+@@ -713,6 +797,9 @@ void dpu_encoder_update_topology(struct drm_encoder *drm_enc,
+ 		if (msm_dp_is_yuv_420_enabled(priv->kms->dp[disp_info->h_tile_instance[0]],
+ 					      adj_mode))
+ 			topology->num_cdm++;
++	} else if (disp_info->intf_type == INTF_DSI) {
++		if (dpu_encoder_dsi_needs_cdm(drm_enc))
++			topology->num_cdm++;
+ 	}
+ }
+ 
+@@ -1231,7 +1318,8 @@ static void dpu_encoder_virt_atomic_mode_set(struct drm_encoder *drm_enc,
+ 	dpu_enc->dsc_mask = dsc_mask;
+ 
+ 	if ((dpu_enc->disp_info.intf_type == INTF_WB && conn_state->writeback_job) ||
+-	    dpu_enc->disp_info.intf_type == INTF_DP) {
++	    dpu_enc->disp_info.intf_type == INTF_DP ||
++	    dpu_encoder_dsi_needs_cdm(drm_enc)) {
+ 		struct dpu_hw_blk *hw_cdm = NULL;
+ 
+ 		dpu_rm_get_assigned_resources(&dpu_kms->rm, global_state,
+@@ -1963,6 +2051,33 @@ int dpu_encoder_vsync_time(struct drm_encoder *drm_enc, ktime_t *wakeup_time)
+ 	return 0;
+ }
+ 
++/*
++ * DSC "initial lines" is a DPU-side value that is NOT carried in the PPS: it is
++ * how many lines the DSC encoder buffers before it starts emitting. Get it wrong
++ * and the rate buffer misbehaves once per slice row -- invisible on flat content,
++ * which never uses its rate budget, and visible as periodic bands on detailed
++ * content. That is exactly what zorn's panel does.
++ *
++ * Note that dpu_hw_dsc.c (the DSC 1.1 block) adds one line in command mode:
++ *
++ *	if (is_cmd_mode)
++ *		initial_lines += 1;
++ *
++ * and dpu_hw_dsc_1_2.c -- the block SM8650 actually uses -- does not. On a
++ * command mode DSC 1.2 panel that difference is a real candidate, so allow the
++ * value to be forced:
++ *
++ *	echo 3 > /sys/module/msm/parameters/dsc_initial_lines
++ *	echo 1 > /sys/class/graphics/fb0/blank; sleep 2
++ *	echo 0 > /sys/class/graphics/fb0/blank
++ *
++ * 0 = use the computed value.
++ */
++static uint dsc_initial_lines;
++module_param(dsc_initial_lines, uint, 0600);
++MODULE_PARM_DESC(dsc_initial_lines,
++		 "Force DSC initial lines (0 = computed)");
++
+ static u32
+ dpu_encoder_dsc_initial_line_calc(struct drm_dsc_config *dsc,
+ 				  u32 enc_ip_width)
+@@ -2054,6 +2169,12 @@ static void dpu_encoder_prep_dsc(struct dpu_encoder_virt *dpu_enc,
+ 
+ 	enc_ip_w = intf_ip_w / num_dsc;
+ 	initial_lines = dpu_encoder_dsc_initial_line_calc(dsc, enc_ip_w);
++	if (dsc_initial_lines)
++		initial_lines = dsc_initial_lines;
++
++	DPU_DEBUG_ENC(dpu_enc,
++		      "dsc: %d engines, mode 0x%x, enc_ip_w %d, initial_lines %d\n",
++		      num_dsc, dsc_common_mode, enc_ip_w, initial_lines);
+ 
+ 	for (i = 0; i < num_dsc; i++)
+ 		dpu_encoder_dsc_pipe_cfg(ctl, hw_dsc[i], hw_pp[i],
+@@ -2337,6 +2458,10 @@ void dpu_encoder_helper_phys_cleanup(struct dpu_encoder_phys *phys_enc)
+ 	if (phys_enc->hw_pp && phys_enc->hw_pp->merge_3d)
+ 		intf_cfg.merge_3d = phys_enc->hw_pp->merge_3d->idx;
+ 
++	/* clear CTL_CDM_ACTIVE too, for the same reason the cmd path sets it */
++	if (phys_enc->hw_cdm)
++		intf_cfg.cdm = phys_enc->hw_cdm->idx;
++
+ 	if (ctl->ops.reset_intf_cfg)
+ 		ctl->ops.reset_intf_cfg(ctl, &intf_cfg);
+ 
+@@ -2420,6 +2545,7 @@ void dpu_encoder_helper_phys_setup_cdm(struct dpu_encoder_phys *phys_enc,
+ 	struct dpu_hw_cdm *hw_cdm;
+ 	struct dpu_hw_cdm_cfg *cdm_cfg;
+ 	struct dpu_hw_pingpong *hw_pp;
++	struct drm_dsc_config *dsc;
+ 	int ret;
+ 
+ 	if (!phys_enc)
+@@ -2447,9 +2573,22 @@ void dpu_encoder_helper_phys_setup_cdm(struct dpu_encoder_phys *phys_enc,
+ 	cdm_cfg->output_height = phys_enc->cached_mode.vdisplay;
+ 	cdm_cfg->output_fmt = dpu_fmt;
+ 	cdm_cfg->output_type = output_type;
+-	cdm_cfg->output_bit_depth = MSM_FORMAT_IS_DX(dpu_fmt) ?
+-			CDM_CDWN_OUTPUT_10BIT : CDM_CDWN_OUTPUT_8BIT;
+-	cdm_cfg->csc_cfg = &dpu_csc10_rgb2yuv_601l;
++	/*
++	 * The DRM format only carries the depth for formats that have a memory
++	 * layout, and the 4:2:2 one picked for the DSI path (NV16) is 8-bit. CDM
++	 * here feeds DSC directly, so the depth that matters is DSC's
++	 * bits_per_component -- 10 on this panel. Programming 8 while DSC reads 10
++	 * shifts every component.
++	 */
++	dsc = dpu_encoder_get_dsc_config(phys_enc->parent);
++	if (dsc && dsc->native_422)
++		cdm_cfg->output_bit_depth = dsc->bits_per_component > 8 ?
++				CDM_CDWN_OUTPUT_10BIT : CDM_CDWN_OUTPUT_8BIT;
++	else
++		cdm_cfg->output_bit_depth = MSM_FORMAT_IS_DX(dpu_fmt) ?
++				CDM_CDWN_OUTPUT_10BIT : CDM_CDWN_OUTPUT_8BIT;
++	cdm_cfg->csc_cfg = dsc_cdm_csc_601 ? &dpu_csc10_rgb2yuv_601l
++					   : &dpu_csc10_identity;
+ 
+ 	/* enable 10 bit logic */
+ 	switch (cdm_cfg->output_fmt->chroma_sample) {
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
+index 93db1484f..c530b912d 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
+@@ -66,6 +66,14 @@ static void _dpu_encoder_phys_cmd_update_intf_cfg(
+ 	intf_cfg.stream_sel = cmd_enc->stream_sel;
+ 	intf_cfg.mode_3d = dpu_encoder_helper_get_3d_blend_mode(phys_enc);
+ 	intf_cfg.dsc = dpu_encoder_helper_get_dsc(phys_enc);
++	/*
++	 * CTL_CDM_ACTIVE has to name the CDM or the CTL does not consider it part
++	 * of this path: the block is configured and flushed, but the CTL start
++	 * interrupt never arrives and every frame times out. Upstream only ever
++	 * filled this in from the writeback encoder, which was the only CDM user.
++	 */
++	if (phys_enc->hw_cdm)
++		intf_cfg.cdm = phys_enc->hw_cdm->idx;
+ 	ctl->ops.setup_intf_cfg(ctl, &intf_cfg);
+ 
+ 	/* setup which pp blk will connect to this intf */
+@@ -447,6 +455,8 @@ static void dpu_encoder_phys_cmd_enable_helper(
+ 		struct dpu_encoder_phys *phys_enc)
+ {
+ 	struct dpu_hw_ctl *ctl;
++	const struct msm_format *fmt;
++	u32 fmt_fourcc;
+ 
+ 	if (!phys_enc->hw_pp) {
+ 		DPU_ERROR("invalid arg(s), encoder %d\n", phys_enc != NULL);
+@@ -455,10 +465,35 @@ static void dpu_encoder_phys_cmd_enable_helper(
+ 
+ 	dpu_encoder_helper_split_config(phys_enc, phys_enc->hw_intf->idx);
+ 
++	/*
++	 * Only a DSC native 4:2:2 panel gets a YUV format back here; in every
++	 * other case get_drm_fmt() returns RGB and setup_cdm() unbinds CDM rather
++	 * than programming it.
++	 *
++	 * OUTPUT_HDMI and not OUTPUT_WB, because that is what turns the packer on
++	 * (CDM_HDMI_PACK_OP_MODE = EN | CHROMA_H2V1 << 1 = 0x3) and interleaves
++	 * the output as Y0 Cb Y1 Cr. WB leaves it planar -- writeback's consumer
++	 * is memory, while DSC's input wants the packed form, the same one the DP
++	 * path asks for. Getting this wrong looks like a picture that is
++	 * structurally broken but carries real colour: the chroma is flowing, just
++	 * not where the decoder reads it.
++	 */
++	fmt_fourcc = dpu_encoder_get_drm_fmt(phys_enc);
++	fmt = mdp_get_format(&phys_enc->dpu_kms->base, fmt_fourcc, 0);
++	dpu_encoder_helper_phys_setup_cdm(phys_enc, fmt, CDM_CDWN_OUTPUT_HDMI);
++
+ 	_dpu_encoder_phys_cmd_pingpong_config(phys_enc);
+ 
+ 	ctl = phys_enc->hw_ctl;
+ 	ctl->ops.update_pending_flush_intf(ctl, phys_enc->hw_intf->idx);
++
++	/*
++	 * The flush bit is what splices CDM into the data path. Without it the
++	 * registers take the write and read back correctly while the block stays
++	 * bypassed -- the same trap the SPR work fell into twice.
++	 */
++	if (ctl->ops.update_pending_flush_cdm && phys_enc->hw_cdm)
++		ctl->ops.update_pending_flush_cdm(ctl, phys_enc->hw_cdm->idx);
+ }
+ 
+ static void dpu_encoder_phys_cmd_enable(struct dpu_encoder_phys *phys_enc)
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_catalog.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_catalog.c
+index c4e1f6b73..dab893c5e 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_catalog.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_catalog.c
+@@ -413,6 +413,31 @@ static const struct dpu_dspp_sub_blks sdm845_dspp_sblk = {
+ 		.len = 0x40, .version = 0x10008},
+ };
+ 
++/*
++ * SPR sits outside the DSPP register window even though downstream addresses it
++ * as a DSPP sub-block. The DSPP bases step by 0x2000 while the SPR blocks step
++ * by 0x1000, so the offset has to shrink by 0x1000 per DSPP for dspp_base +
++ * spr_base to land on the right block -- these four values are
++ * qcom,sde-dspp-spr-off = <0x15400 0x14400 0x13400 0x12400> from the vendor DT,
++ * rebased by the 0x1000 between mdss and mdp. One shared offset silently aims
++ * the second mixer's writes at the third SPR block and leaves SPR_1 disabled,
++ * which on a two-mixer panel means the right half of the screen has no SPR.
++ */
++#define SM8650_DSPP_SBLK(_spr_base)					\
++	{								\
++		.pcc = {.name = "pcc", .base = 0x1700,			\
++			.len = 0x90, .version = 0x40000},		\
++		.gc = {.name = "gc", .base = 0x17c0,			\
++			.len = 0x40, .version = 0x10008},		\
++		.spr = {.name = "spr", .base = _spr_base,		\
++			.len = 0x200, .version = 0x20000},		\
++	}
++
++static const struct dpu_dspp_sub_blks sm8650_dspp_sblk_0 = SM8650_DSPP_SBLK(0x15400);
++static const struct dpu_dspp_sub_blks sm8650_dspp_sblk_1 = SM8650_DSPP_SBLK(0x14400);
++static const struct dpu_dspp_sub_blks sm8650_dspp_sblk_2 = SM8650_DSPP_SBLK(0x13400);
++static const struct dpu_dspp_sub_blks sm8650_dspp_sblk_3 = SM8650_DSPP_SBLK(0x12400);
++
+ static const struct dpu_dspp_sub_blks sm8750_dspp_sblk = {
+ 	.pcc = {.name = "pcc", .base = 0x1700,
+ 		.len = 0x90, .version = 0x60000},
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_catalog.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_catalog.h
+index 70d5ed473..f6cad962b 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_catalog.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_catalog.h
+@@ -78,10 +78,12 @@ enum {
+  * DSPP sub-blocks
+  * @DPU_DSPP_PCC             Panel color correction block
+  * @DPU_DSPP_GC              Gamma correction block
++ * @DPU_DSPP_SPR             Sub-pixel rendering block
+  */
+ enum {
+ 	DPU_DSPP_PCC = 0x1,
+ 	DPU_DSPP_GC,
++	DPU_DSPP_SPR,
+ 	DPU_DSPP_MAX
+ };
+ 
+@@ -331,10 +333,15 @@ struct dpu_lm_sub_blks {
+  * struct dpu_dspp_sub_blks: Information of DSPP block
+  * @pcc: pixel color correction block
+  * @gc: gamma correction block
++ * @spr: sub-pixel rendering block, which repacks each line for panels whose
++ *	subpixels are not an RGB stripe (pentile and friends). Note its base is
++ *	an offset from the DSPP block but the hardware does not sit inside it,
++ *	so the value differs per DSPP and is large.
+  */
+ struct dpu_dspp_sub_blks {
+ 	struct dpu_pp_blk pcc;
+ 	struct dpu_pp_blk gc;
++	struct dpu_pp_blk spr;
+ };
+ 
+ struct dpu_pingpong_sub_blks {
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_cdm.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_cdm.c
+index 3f88c3641..c24e267c1 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_cdm.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_cdm.c
+@@ -201,6 +201,17 @@ static int dpu_hw_cdm_enable(struct dpu_hw_cdm *ctx, struct dpu_hw_cdm_cfg *cdm)
+ 
+ 	DPU_REG_WRITE(c, CDM_CSC_10_OPMODE, csc);
+ 	DPU_REG_WRITE(c, CDM_HDMI_PACK_OP_MODE, opmode);
++
++	/*
++	 * Printed for the same reason the DSC one is: on a command-mode panel
++	 * these registers cannot be read back from userspace without risking an
++	 * unclocked access, and a wrong value here costs a reboot to find.
++	 */
++	pr_info("dpu_cdm: %ux%u %p4cc h_cdwn %u v_cdwn %u depth %u out_type %u CSC_OPMODE %#x PACK_OPMODE %#x\n",
++		cdm->output_width, cdm->output_height, &fmt->pixel_format,
++		cdm->h_cdwn_type, cdm->v_cdwn_type, cdm->output_bit_depth,
++		cdm->output_type, csc, opmode);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.c
+index 36a497f1d..bcc7a6123 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.c
+@@ -402,6 +402,9 @@ static void dpu_hw_ctl_update_pending_flush_dspp_sub_blocks(
+ 	case DPU_DSPP_GC:
+ 		ctx->pending_dspp_flush_mask[dspp - DSPP_0] |= BIT(5);
+ 		break;
++	case DPU_DSPP_SPR:
++		ctx->pending_dspp_flush_mask[dspp - DSPP_0] |= BIT(8);
++		break;
+ 	default:
+ 		return;
+ 	}
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc.h
+index 39d93b9df..45dc50279 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc.h
+@@ -64,6 +64,13 @@ struct dpu_hw_dsc {
+ 
+ 	/* ops */
+ 	struct dpu_hw_dsc_ops ops;
++
++	/* last DSC_MAIN_CONF written, so the log line is emitted only on change */
++	u32 last_main_conf;
++
++	/* last read-back wrapper registers, same reason */
++	u32 last_ctl_cfg;
++	u32 last_data_in_swap;
+ };
+ 
+ struct dpu_hw_dsc *dpu_hw_dsc_init(struct drm_device *dev,
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc_1_2.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc_1_2.c
+index b3395e9c3..195f95af0 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc_1_2.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc_1_2.c
+@@ -58,10 +58,93 @@
+ #define DSC_DATA_IN_SWAP           0x08
+ #define DSC_CLK_CTRL               0x0C
+ 
++/*
++ * Two things in ENC_DF_CTRL that the vendor driver programs and this one does not.
++ * Both only bite on detailed content -- flat colour never uses the rate budget and
++ * never exercises the indexed colour history -- which is exactly how zorn's panel
++ * fails: solid fills are pixel-perfect, dense text corrupts once per slice row.
++ *
++ * dsc_ob_max_addr: the DSC output buffer's maximum address. Upstream halves it
++ *	whenever the block merely *has* the native 4:2:x capability:
++ *
++ *		max_addr = 2400 / num_softslice;
++ *		if (features & BIT(DPU_DSC_NATIVE_42x_EN)) max_addr /= 2;
++ *
++ *	and the SM8650 catalog sets that bit on dce_0_0/dce_0_1, so we program 1199.
++ *	The vendor uses the 4:2:2 bit only to choose a table row and halves on a
++ *	*separate* capability (SDE_DSC_REDUCED_OB_MAX):
++ *
++ *		if (!(features & BIT(SDE_DSC_NATIVE_422_EN)))
++ *			if (num_ss == 1) return reduced_ob_max ? 1199 : 2399;
++ *
++ *	We are RGB, not 4:2:2, so the vendor value is 2399 unless this SoC sets
++ *	has_reduced_ob_max. A half-size output FIFO overflows precisely when the
++ *	compressed data is large. 0 = keep upstream's formula.
++ *
++ * dsc_full_ich_prec: BIT(12), full indexed-colour-history precision. The vendor
++ *	sets it when the DPU is >= A00 (ours reports revision 0xa0000000) and
++ *	bits_per_component > 8 (ours is 10):
++ *
++ *		if (test_bit(SDE_DSC_FULL_ICH_PREC, &caps->features) &&
++ *		    dsc->config.bits_per_component > 8)
++ *			data |= BIT(12);
++ *
++ *	Upstream has no notion of it and never sets it. ICH caches recently used
++ *	pixel values within a slice, so it is dormant on a flat fill and heavily
++ *	used on text; running it at reduced precision while the PPS declares 10 bpc
++ *	makes the reconstruction drift per slice.
++ */
++static uint dsc_ob_max_addr;
++module_param(dsc_ob_max_addr, uint, 0600);
++MODULE_PARM_DESC(dsc_ob_max_addr,
++		 "Force the DSC output buffer max address (0 = upstream formula)");
++
++static bool dsc_full_ich_prec;
++module_param(dsc_full_ich_prec, bool, 0600);
++MODULE_PARM_DESC(dsc_full_ich_prec,
++		 "Set ENC_DF_CTRL BIT(12), full ICH precision, as the vendor does for >8 bpc");
++
++/*
++ * Dump the DSC encoder block after configuring it, for a field-by-field diff
++ * against the same registers read off a running vendor stack. Off by default --
++ * this runs on every kickoff, and left on it fills dmesg fast enough to keep
++ * journald writing continuously.
++ */
++static bool dsc_dump_regs;
++module_param(dsc_dump_regs, bool, 0600);
++MODULE_PARM_DESC(dsc_dump_regs,
++		 "dump the DSC encoder registers after each config; noisy");
++
++/*
++ * DSC_CFG BIT(17). Upstream sets it for every command-mode panel. The vendor
++ * touches that bit only inside its 4HS-merge path, where it means the opposite
++ * (1 = *video* mode) and belongs to a group -- BIT(16) 4HS-merge-enable,
++ * bits[21:18] padding, bits[25:22] alignment -- that is only written when
++ * dsc_4hsmerge_en is set. zorn has two DSC blocks, not four, so 4HS merge is off
++ * and the vendor's value for this bit is 0.
++ *
++ * Default off, i.e. the vendor's value. The register is rewritten every frame
++ * from dpu_hw_dsc_config_1_2(), so this parameter takes effect on the next frame
++ * with no modeset needed.
++ */
++static bool dsc_cfg_bit17;
++module_param(dsc_cfg_bit17, bool, 0600);
++MODULE_PARM_DESC(dsc_cfg_bit17,
++		 "set DSC_CFG BIT(17) in command mode (upstream behaviour; vendor leaves it clear)");
++
++/* -1 leaves DSC_DATA_IN_SWAP at its reset value; see where it is written. */
++static int dsc_data_in_swap = -1;
++module_param(dsc_data_in_swap, int, 0600);
++MODULE_PARM_DESC(dsc_data_in_swap,
++		 "value to program into DSC_DATA_IN_SWAP (-1 = leave at reset)");
++
+ static int _dsc_calc_output_buf_max_addr(struct dpu_hw_dsc *hw_dsc, int num_softslice)
+ {
+ 	int max_addr = 2400 / num_softslice;
+ 
++	if (dsc_ob_max_addr)
++		return dsc_ob_max_addr;
++
+ 	if (hw_dsc->caps->features & BIT(DPU_DSC_NATIVE_42x_EN))
+ 		max_addr /= 2;
+ 
+@@ -124,6 +207,9 @@ static void dpu_hw_dsc_config_1_2(struct dpu_hw_dsc *hw_dsc,
+ 
+ 	data |= (_dsc_calc_output_buf_max_addr(hw_dsc, num_active_slice_per_enc) << 18);
+ 
++	if (dsc_full_ich_prec && dsc->bits_per_component > 8)
++		data |= BIT(12);
++
+ 	DPU_REG_WRITE(hw, sblk->enc.base + ENC_DF_CTRL, data);
+ 
+ 	data = (dsc->dsc_version_minor & 0xf) << 28;
+@@ -154,6 +240,29 @@ static void dpu_hw_dsc_config_1_2(struct dpu_hw_dsc *hw_dsc,
+ 
+ 	DPU_REG_WRITE(hw, sblk->enc.base + DSC_MAIN_CONF, data);
+ 
++	/*
++	 * MAIN_CONF is the register that decides how the panel's decoder reads the
++	 * chroma channels, so it is the one worth seeing. It is printed rather than
++	 * read back because there is no safe way to read it from userspace on this
++	 * SoC: /dev/mem works only while the DPU happens to be powered, and a
++	 * command-mode panel idle-collapses it between one syscall and the next --
++	 * reading it collapsed is an unclocked access that TZ answers with a hard
++	 * reset, no log, no panic. pr_info and not a debug print because a wrong
++	 * value here costs a reboot to discover.
++	 *
++	 * Only on change: this runs from prepare_for_kickoff, i.e. every frame on
++	 * both DSC blocks, and at 120 Hz that is ~240 lines a second -- enough to
++	 * push the interesting part of the boot out of the ring buffer, which it
++	 * did.
++	 */
++	if (data != hw_dsc->last_main_conf) {
++		hw_dsc->last_main_conf = data;
++		pr_info("dpu_dsc: MAIN_CONF %#010x  bpc %u lbd %u bpp %u/16 native_422 %d native_420 %d convert_rgb %d block_pred %d dsc 1.%u\n",
++			data, dsc->bits_per_component, dsc->line_buf_depth,
++			dsc->bits_per_pixel, dsc->native_422, dsc->native_420,
++			dsc->convert_rgb, dsc->block_pred_enable,
++			dsc->dsc_version_minor);
++	}
+ 	data = (dsc->pic_width & 0xffff) |
+ 		((dsc->pic_height & 0xffff) << 16);
+ 
+@@ -232,10 +341,50 @@ static void dpu_hw_dsc_config_1_2(struct dpu_hw_dsc *hw_dsc,
+ 		data |= BIT(12);
+ 	if (mode & DSC_MODE_MULTIPLEX)
+ 		data |= BIT(13);
+-	if (!(mode & DSC_MODE_VIDEO))
++	if (dsc_cfg_bit17 && !(mode & DSC_MODE_VIDEO))
+ 		data |= BIT(17);
+ 
+ 	DPU_REG_WRITE(hw, sblk->ctl.base + DSC_CFG, data);
++
++	/*
++	 * DSC_DATA_IN_SWAP is never written by either stack -- upstream and the
++	 * vendor both only #define it -- so it sits at its reset value. Its name is
++	 * the only documentation there is, and it is the one register left on the
++	 * path that could plausibly decide which input channels the wrapper reads.
++	 * That matters because on zorn the wrapper emits only two components: a
++	 * full-rate Y from channel 1 and one half-rate chroma from the horizontal
++	 * average of channel 2, with channel 0 never sampled. Measured over
++	 * eighteen swatches (nine plain, nine with red forced into the odd-column
++	 * blue slot), output is always (C, G, C) with C = avg(P0.b, P1.b).
++	 *
++	 * Writable so the value can be swept without a rebuild: the register is
++	 * rewritten every frame from here, so a new value lands on the next frame.
++	 * -1 leaves the reset value alone.
++	 */
++	if (dsc_data_in_swap >= 0)
++		DPU_REG_WRITE(hw, sblk->ctl.base + DSC_DATA_IN_SWAP,
++			      (u32)dsc_data_in_swap);
++
++	/*
++	 * Read back rather than log what was written: DATA_IN_SWAP's reset value is
++	 * the unknown, and CMN_MAIN_CNF and the wrapper's DSC_CFG have no Android
++	 * counterpart to compare against -- sde_dbg on the vendor kernel refuses
++	 * offsets outside the two encoder sub-blocks, so these three have never been
++	 * seen on a working stack. Only on change, for the reason MAIN_CONF is.
++	 */
++	{
++		u32 cfg_rb = DPU_REG_READ(hw, sblk->ctl.base + DSC_CFG);
++		u32 swap_rb = DPU_REG_READ(hw, sblk->ctl.base + DSC_DATA_IN_SWAP);
++		u32 cmn_rb = DPU_REG_READ(hw, DSC_CMN_MAIN_CNF);
++
++		if (cfg_rb != hw_dsc->last_ctl_cfg ||
++		    swap_rb != hw_dsc->last_data_in_swap) {
++			hw_dsc->last_ctl_cfg = cfg_rb;
++			hw_dsc->last_data_in_swap = swap_rb;
++			pr_info("dpu_dsc: DSC_CFG %#010x DATA_IN_SWAP %#010x CMN_MAIN_CNF %#010x\n",
++				cfg_rb, swap_rb, cmn_rb);
++		}
++	}
+ }
+ 
+ static void dpu_hw_dsc_config_thresh_1_2(struct dpu_hw_dsc *hw_dsc,
+@@ -244,6 +393,7 @@ static void dpu_hw_dsc_config_thresh_1_2(struct dpu_hw_dsc *hw_dsc,
+ 	struct dpu_hw_blk_reg_map *hw;
+ 	const struct dpu_dsc_sub_blks *sblk;
+ 	struct drm_dsc_rc_range_parameters *rc;
++	u32 off;
+ 
+ 	if (!hw_dsc || !dsc)
+ 		return;
+@@ -341,6 +491,29 @@ static void dpu_hw_dsc_config_thresh_1_2(struct dpu_hw_dsc *hw_dsc,
+ 		      (rc[12].range_bpg_offset << 12) |
+ 		      (rc[13].range_bpg_offset << 18) |
+ 		      (rc[14].range_bpg_offset << 24));
++
++	/*
++	 * The whole encoder block, read back after everything is written, so it
++	 * can be diffed field by field against the same registers read off a
++	 * running Android. Off by default: this is called on every kickoff, not
++	 * once per modeset, and left on it floods dmesg badly enough to matter
++	 * (thousands of dumps within a minute, journald writing continuously).
++	 *
++	 *	echo 1 > /sys/module/msm/parameters/dsc_dump_regs
++	 *
++	 * Offsets are printed relative to the DSC block, so
++	 * "dmesg | grep 'dpu_dsc 0'" lines up with a dpu-snapshot.py capture
++	 * rebased on 0x0ae81000. Reading here is safe -- the block is being
++	 * configured, so it is necessarily powered.
++	 */
++	if (dsc_dump_regs)
++		for (off = 0; off < 0x80; off += 16)
++			pr_info("dpu_dsc %08x: %08x %08x %08x %08x\n",
++				sblk->enc.base + off,
++				DPU_REG_READ(hw, sblk->enc.base + off),
++				DPU_REG_READ(hw, sblk->enc.base + off + 4),
++				DPU_REG_READ(hw, sblk->enc.base + off + 8),
++				DPU_REG_READ(hw, sblk->enc.base + off + 12));
+ }
+ 
+ static void dpu_hw_dsc_bind_pingpong_blk_1_2(struct dpu_hw_dsc *hw_dsc,
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dspp.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dspp.c
+index 23dcbe1ce..ab3b95427 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dspp.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dspp.c
+@@ -2,6 +2,8 @@
+ /* Copyright (c) 2015-2018, The Linux Foundation. All rights reserved.
+  */
+ 
++#include <linux/moduleparam.h>
++
+ #include <drm/drm_managed.h>
+ 
+ #include "dpu_hwio.h"
+@@ -28,6 +30,185 @@
+ #define GC_EN BIT(0)
+ #define GC_DIS 0
+ #define GC_8B_ROUND_EN BIT(1)
++
++/*
++ * DSPP_SPR -- sub-pixel rendering.
++ *
++ * This block repacks each scanline for panels whose subpixels are not an RGB
++ * stripe. Xiaomi's o11 panel on zorn is pentile: its green subpixels are one per
++ * pixel but red and blue are only one per two, so red and blue have to be phase
++ * shifted and merged across neighbouring pixels. Without that, green and white
++ * come out correct while saturated red washes out to grey and blue shifts to
++ * violet -- which is exactly what the panel does with SPR left off.
++ *
++ * The configuration below is not derived, it is transcribed: the whole 0x100
++ * window was read out of a running Android through the downstream SDE debugfs
++ * (dri/0/debug/sde_off + sde_reg) with the panel displaying correctly. That
++ * sidesteps having to reverse the ten undocumented scalar fields packed into
++ * SPR_OPMODE, for which the vendor sources carry neither comments nor bindings.
++ *
++ * Two of the values can be recognised in Binaries/zorn/RawFiles/
++ * sprconfig_o11_42_02_0a_dsc_cmd.xml, which is a useful cross-check that the
++ * block and the offsets are the ones being talked about:
++ *
++ *   ColorPhaseOffsetsRed  "2, -2"  -> 0x000003c2 at +0x24
++ *					(2 and 30, i.e. -2, in 5-bit fields)
++ *   ColorPhaseOffsetsBlue "-2, 2"  -> 0x0000005e at +0x2c
++ *   FilterCoeffs "0,256,256,0,..." -> 0x01000000 / 0x00000100 from +0x34
++ *
++ * The phase offsets sit at +0x24 and +0x2c, not +0x28 and +0x30 -- they are the
++ * first and third word of one array the vendor writes as a block from +0x24
++ * (reg_dmav1_setup_spr_init_common: reg_off = base_off + 0x24, six 5-bit fields
++ * per word), and both the bootloader and a running Android read back 0x3c2 at
++ * +0x24 and 0x5e at +0x2c with +0x28 and +0x30 zero. Writing them one word high
++ * lands them on array entries 6..7 and 18..19 and leaves the real ones zero.
++ *
++ * Being a transcription it is specific to this panel at 1440x3200 with two
++ * layer mixers. Anything else needs its own dump; there is no DT binding for
++ * these yet, and inventing one before a second panel exists would be guesswork.
++ */
++/*
++ * Sub-pixel rendering. Needed on pentile panels: with it off, red and blue are
++ * visibly wrong while green and white are fine. Setting this to N restores the
++ * previous behaviour, which is the comparison to reach for if a panel's
++ * transcribed configuration turns out not to suit it.
++ */
++static bool dpu_enable_spr = true;
++module_param_named(enable_spr, dpu_enable_spr, bool, 0600);
++MODULE_PARM_DESC(enable_spr,
++		 "Program the DPU sub-pixel rendering block (pentile panels)");
++
++#define SPR_OPMODE			0x04
++#define SPR_OPMODE_EN			BIT(0)
++
++static const struct {
++	u32 off;
++	u32 val;
++} dpu_spr_o11_cfg[] = {
++	{ 0x08, 0x00000001 }, /* two layer mixers */
++	{ 0x10, 0x02d002d0 }, /* 720 + 720 */
++	{ 0x24, 0x000003c2 }, /* red phase offsets   +2, -2 */
++	{ 0x2c, 0x0000005e }, /* blue phase offsets  -2, +2 */
++	{ 0x34, 0x01000000 }, /* filter coefficients, 0/256 alternating */
++	{ 0x38, 0x00000100 },
++	{ 0x3c, 0x01000000 },
++	{ 0x40, 0x00000100 },
++	{ 0x44, 0x01000000 },
++	{ 0x48, 0x00000100 },
++	{ 0x4c, 0x01000000 },
++	{ 0x50, 0x00000100 },
++	/*
++	 * From +0x54 down to +0xf4 the values below already match what the block
++	 * holds at reset -- they were read back identically from an Android that
++	 * had not yet programmed SPR. They are written anyway so the block is in
++	 * a known state rather than an assumed one. The genuinely
++	 * HAL-programmed part is everything above, plus the ramp at +0xa0, which
++	 * reads 0x00800000/0x01800100... unconfigured and the values below once
++	 * Android has set it up.
++	 */
++	{ 0x54, 0x01062080 },
++	{ 0x60, 0x0000000f },
++	{ 0x70, 0x15555555 },
++	{ 0x7c, 0x04441212 },
++	{ 0x90, 0x00000008 },
++	{ 0x98, 0x0000e401 },
++	{ 0xa0, 0x00840000 }, /* the 16-entry ramp from +0xa0 */
++	{ 0xa4, 0x018c0108 },
++	{ 0xa8, 0x02950211 },
++	{ 0xac, 0x039d0319 },
++	{ 0xb0, 0x04a50421 },
++	{ 0xb4, 0x05ad0529 },
++	{ 0xb8, 0x06b60632 },
++	{ 0xbc, 0x07be073a },
++	{ 0xc0, 0x08c60842 },
++	{ 0xc4, 0x09ce094a },
++	{ 0xc8, 0x0ad70a53 },
++	{ 0xcc, 0x0bdf0b5b },
++	{ 0xd0, 0x0ce70c63 },
++	{ 0xd4, 0x0def0d6b },
++	{ 0xd8, 0x0ef80e74 },
++	{ 0xdc, 0x0fff0f7c },
++	{ 0xe4, 0x000000c0 },
++	{ 0xe8, 0x00005d7f },
++	{ 0xec, 0x000091b3 },
++	{ 0xf0, 0x00006e4c },
++	{ 0xf4, 0x0000a280 },
++};
++
++/* opmode as Android leaves it; bit 0 is the enable. */
++#define SPR_OPMODE_O11			0x05289107
++
++/*
++ * ABL's opmode, and the reason there is a choice. ABL renders this panel with
++ * correct colour -- blue text in the boot log is blue -- and a snapshot taken
++ * from UEFI while its DPU was still live (SiliciumPkg/Drivers/DpuSnapshotDxe)
++ * shows SPR *enabled but otherwise at reset*: opmode 0x00289107, the +0xa0 ramp
++ * still 0x00800000/0x01800100..., and +0x54/+0x78/+0x7c untouched. Android, also
++ * correct, has all of those programmed differently.
++ *
++ * Two references that both work and disagree on a register mean that register is
++ * not what breaks the third one -- so this whole table is off the critical path.
++ * The parameter exists to make that conclusion testable rather than argued:
++ * spr_abl_minimal=1 writes exactly what ABL had, nothing else.
++ */
++#define SPR_OPMODE_O11_ABL		0x00289107
++
++/*
++ * ABL's SPR configuration: the registers it actually differs from reset on, and
++ * nothing more. Deliberately short -- the point is to reproduce the minimal
++ * state that is known to render correctly, not to configure the block well.
++ */
++static const struct {
++	u32 off;
++	u32 val;
++} dpu_spr_o11_abl_cfg[] = {
++	{ 0x08, 0x00000001 }, /* two layer mixers */
++	{ 0x10, 0x02d002d0 }, /* 720 + 720 */
++	{ 0x24, 0x000003c2 }, /* red phase offsets   +2, -2 */
++	{ 0x2c, 0x0000005e }, /* blue phase offsets  -2, +2 */
++	{ 0x34, 0x01000000 }, /* filter coefficients, 0/256 alternating */
++	{ 0x38, 0x00000100 },
++	{ 0x3c, 0x01000000 },
++	{ 0x40, 0x00000100 },
++	{ 0x44, 0x01000000 },
++	{ 0x48, 0x00000100 },
++	{ 0x4c, 0x01000000 },
++	{ 0x50, 0x00000100 },
++	{ 0x54, 0x01084210 }, /* ABL: 0x01084210, Android: 0x01062080 */
++	{ 0x60, 0x0000000f },
++	{ 0x70, 0x15555555 },
++	{ 0x78, 0x00000000 }, /* ABL leaves both of these at zero */
++	{ 0x7c, 0x00000000 },
++	{ 0x90, 0x00000008 },
++	{ 0x98, 0x0000e401 },
++	/* the +0xa0 ramp as ABL leaves it: unconfigured, a plain 0x100 step */
++	{ 0xa0, 0x00800000 },
++	{ 0xa4, 0x01800100 },
++	{ 0xa8, 0x02800200 },
++	{ 0xac, 0x03800300 },
++	{ 0xb0, 0x04800400 },
++	{ 0xb4, 0x05800500 },
++	{ 0xb8, 0x06800600 },
++	{ 0xbc, 0x07800700 },
++	{ 0xc0, 0x08800800 },
++	{ 0xc4, 0x09800900 },
++	{ 0xc8, 0x0a800a00 },
++	{ 0xcc, 0x0b800b00 },
++	{ 0xd0, 0x0c800c00 },
++	{ 0xd4, 0x0d800d00 },
++	{ 0xd8, 0x0e800e00 },
++	{ 0xdc, 0x0f800f00 },
++	{ 0xe4, 0x000000c0 },
++	{ 0xe8, 0x00005d7f },
++	{ 0xec, 0x000091b3 },
++	{ 0xf0, 0x00006e4c },
++	{ 0xf4, 0x0000a280 },
++};
++
++static bool dpu_spr_abl_minimal;
++module_param_named(spr_abl_minimal, dpu_spr_abl_minimal, bool, 0600);
++MODULE_PARM_DESC(spr_abl_minimal,
++		 "Program SPR exactly as ABL leaves it instead of as Android does");
+ #define GC_LUT_SWAP_OFF 0x1c
+ #define GC_C0_OFF 0x4
+ #define GC_C1_OFF 0xc
+@@ -123,6 +304,71 @@ static void dpu_setup_dspp_gc(struct dpu_hw_dspp *ctx,
+  * @addr: Mapped register io address of MDP
+  * Return: pointer to structure or ERR_PTR
+  */
++/*
++ * Report what the block took, but only when it changes: this runs from
++ * dpu_crtc_atomic_begin() on every commit, so an unconditional print would be
++ * one line per frame. The window offset is worth printing at all because it is
++ * derived, not fixed -- SPR lives outside the DSPP register window and its
++ * offset shrinks as the DSPP base grows, and getting that wrong writes a valid
++ * configuration into the wrong SPR block, which looks exactly like "SPR has no
++ * effect". Compare the offset against a bootloader snapshot: mdp+0x69400 is
++ * SPR_0 at 0x0ae6a400, mdp+0x6a400 is SPR_1 at 0x0ae6b400.
++ */
++static void dpu_spr_report(struct dpu_hw_dspp *ctx, u32 base, u32 had)
++{
++	u32 off;
++
++	if (DPU_REG_READ(&ctx->hw, base + SPR_OPMODE) == had)
++		return;
++
++	/*
++	 * Same layout as the bootloader snapshot so the two can be diffed line
++	 * by line -- the bootloader renders this panel correctly and its SPR
++	 * window is the only readable copy of a working configuration.
++	 */
++	for (off = 0; off < 0x100; off += 0x10)
++		pr_info("dpu_spr: %s mdp+%05x: %08x %08x %08x %08x\n",
++			ctx->cap->name, ctx->cap->base + base + off,
++			DPU_REG_READ(&ctx->hw, base + off),
++			DPU_REG_READ(&ctx->hw, base + off + 4),
++			DPU_REG_READ(&ctx->hw, base + off + 8),
++			DPU_REG_READ(&ctx->hw, base + off + 12));
++}
++
++static void dpu_setup_dspp_spr(struct dpu_hw_dspp *ctx, bool enable)
++{
++	u32 base = ctx->cap->sblk->spr.base;
++	u32 had = DPU_REG_READ(&ctx->hw, base + SPR_OPMODE);
++	int i;
++
++	if (!enable || !dpu_enable_spr) {
++		DPU_REG_WRITE(&ctx->hw, base + SPR_OPMODE, 0);
++		dpu_spr_report(ctx, base, had);
++		return;
++	}
++
++	/*
++	 * Everything before the opmode, so the block is never enabled while it
++	 * is still half configured.
++	 */
++	if (dpu_spr_abl_minimal) {
++		for (i = 0; i < ARRAY_SIZE(dpu_spr_o11_abl_cfg); i++)
++			DPU_REG_WRITE(&ctx->hw, base + dpu_spr_o11_abl_cfg[i].off,
++				      dpu_spr_o11_abl_cfg[i].val);
++
++		DPU_REG_WRITE(&ctx->hw, base + SPR_OPMODE, SPR_OPMODE_O11_ABL);
++		dpu_spr_report(ctx, base, had);
++		return;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(dpu_spr_o11_cfg); i++)
++		DPU_REG_WRITE(&ctx->hw, base + dpu_spr_o11_cfg[i].off,
++			      dpu_spr_o11_cfg[i].val);
++
++	DPU_REG_WRITE(&ctx->hw, base + SPR_OPMODE, SPR_OPMODE_O11);
++	dpu_spr_report(ctx, base, had);
++}
++
+ struct dpu_hw_dspp *dpu_hw_dspp_init(struct drm_device *dev,
+ 				     const struct dpu_dspp_cfg *cfg,
+ 				     void __iomem *addr)
+@@ -146,6 +392,8 @@ struct dpu_hw_dspp *dpu_hw_dspp_init(struct drm_device *dev,
+ 		c->ops.setup_pcc = dpu_setup_dspp_pcc;
+ 	if (c->cap->sblk->gc.base)
+ 		c->ops.setup_gc = dpu_setup_dspp_gc;
++	if (c->cap->sblk->spr.base)
++		c->ops.setup_spr = dpu_setup_dspp_spr;
+ 
+ 	return c;
+ }
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dspp.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dspp.h
+index b47b77880..76e3e013a 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dspp.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dspp.h
+@@ -72,6 +72,13 @@ struct dpu_hw_dspp_ops {
+ 	 */
+ 	void (*setup_gc)(struct dpu_hw_dspp *ctx, struct dpu_hw_gc_lut *gc_lut);
+ 
++	/**
++	 * setup_spr - enable or bypass the sub-pixel rendering block
++	 * @ctx: Pointer to dspp context
++	 * @enable: true to program and enable SPR, false to bypass it
++	 */
++	void (*setup_spr)(struct dpu_hw_dspp *ctx, bool enable);
++
+ };
+ 
+ /**
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_util.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_util.c
+index c7a5f4a0d..1bc3c1ca2 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_util.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_util.c
+@@ -8,11 +8,29 @@
+ #include "msm_drv.h"
+ #include "dpu_kms.h"
+ #include "dpu_hw_mdss.h"
++#include <linux/moduleparam.h>
++
+ #include "dpu_hw_util.h"
+ 
+ /* using a file static variables for debugfs access */
+ static u32 dpu_hw_util_log_mask = DPU_DBG_MASK_NONE;
+ 
++/*
++ * Also a module parameter, not only a debugfs knob, because the interesting
++ * register programming happens during the first modeset -- before anything can
++ * write to debugfs. dpu_encoder_prep_dsc(), which programs the whole DSC encoder
++ * block, runs on a full modeset only and not on a DPMS cycle, so setting the mask
++ * afterwards captures nothing.
++ *
++ *	msm.hw_log_mask=0x800     (DPU_DBG_MASK_DSC, 1 << 11)
++ *
++ * needs drm.debug to include DRIVER (0x02) as well, since the writes are logged
++ * through DRM_DEBUG_DRIVER.
++ */
++module_param_named(hw_log_mask, dpu_hw_util_log_mask, uint, 0600);
++MODULE_PARM_DESC(hw_log_mask,
++		 "DPU block mask for logging every register write (see DPU_DBG_MASK_*)");
++
+ /* DPU_SCALER_QSEED3 */
+ #define QSEED3_HW_VERSION                  0x00
+ #define QSEED3_OP_MODE                     0x04
+diff --git a/drivers/gpu/drm/msm/dsi/dsi_host.c b/drivers/gpu/drm/msm/dsi/dsi_host.c
+index 50474c994..2fa4dd007 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -34,6 +34,68 @@
+ 
+ #define DSI_RESET_TOGGLE_DELAY_MS 20
+ 
++/*
++ * Override the uncompressed bits-per-pixel used to derive the DSI byte clock on
++ * a DSC link. See the comment in dsi_byte_clk_get_rate(). 0 = stock upstream
++ * behaviour (take it from the MIPI DSI pixel format, which cannot express more
++ * than 8 bpc). Set to bits_per_component * 3 -- 30 for a 10 bpc panel -- to make
++ * it agree with dsi_adjust_pclk_for_compression().
++ */
++/*
++ * Slices carried in one DSI packet. mainline says outright that it only supports
++ * one -- dsi_update_dsc_timing() has
++ *
++ *	bytes_per_pkt = dsc->slice_chunk_size; / * * slice_per_pkt; * /
++ *	...
++ *	/ * Since the current driver only supports slice_per_pkt = 1,
++ *	  * pkt_per_line will be equal to slice per intf for now. * /
++ *	pkt_per_line = slice_per_intf;
++ *
++ * -- and zorn's panel asks for two: qcom,mdss-dsc-slice-per-pkt = <2>. The vendor
++ * driver computes (sde_dsc_populate_dsc_private_params)
++ *
++ *	bytes_per_pkt = bytes_in_slice * slice_per_pkt;   / * 720 * 2 = 1440 * /
++ *	pkt_per_line  = slice_per_intf / slice_per_pkt;   / * 2 / 2 = 1    * /
++ *
++ * so the panel expects one 1440-byte packet per line holding both slices, while
++ * mainline sends two 720-byte packets. Total bytes per line match, which is why
++ * every clock, PHY and DSC-parameter experiment came out identical -- the framing
++ * is what differs, and a mis-framed DSC stream corrupts per slice.
++ *
++ * drm_dsc_config has no field for this, so it is a parameter for now:
++ *
++ *	echo 2 > /sys/module/msm/parameters/dsi_dsc_slice_per_pkt
++ *	echo 1 > /sys/class/graphics/fb0/blank; sleep 2
++ *	echo 0 > /sys/class/graphics/fb0/blank
++ */
++static uint dsi_dsc_slice_per_pkt = 1;
++module_param(dsi_dsc_slice_per_pkt, uint, 0600);
++MODULE_PARM_DESC(dsi_dsc_slice_per_pkt,
++		 "DSC slices per DSI packet (1 = upstream behaviour)");
++
++static uint dsi_dsc_uncompressed_bpp;
++module_param(dsi_dsc_uncompressed_bpp, uint, 0600);
++MODULE_PARM_DESC(dsi_dsc_uncompressed_bpp,
++		 "Uncompressed bpp for DSC byte-clock math (0 = from pixel format)");
++
++/*
++ * Force DSC's convert_rgb instead of deriving it from the chroma format.
++ * 2 = derive (upstream: on for 4:4:4, off for native 4:2:x), 0/1 = force.
++ *
++ * convert_rgb=0 says the data reaching DSC is already YCbCr. That is what the
++ * vendor programs, but the vendor's DPU also never runs a CDM on the DSI path,
++ * so what actually arrives is RGB -- which only works out if the panel treats
++ * the three decoded channels as RGB again. With convert_rgb=0 on mainline the
++ * picture is structurally perfect but every colour with R != B collapses to
++ * white or black, i.e. the chroma channels are being read at the wrong scale.
++ * Forcing 1 makes DSC do the RGB -> YCoCg transform itself, which is the
++ * self-consistent story when the source really is RGB.
++ */
++static uint dsc_convert_rgb = 2;
++module_param(dsc_convert_rgb, uint, 0600);
++MODULE_PARM_DESC(dsc_convert_rgb,
++		 "DSC convert_rgb: 0/1 to force, 2 = derive from chroma format");
++
+ static int dsi_populate_dsc_params(struct msm_dsi_host *msm_host, struct drm_dsc_config *dsc);
+ 
+ static int dsi_get_version(const void __iomem *base, u32 *major, u32 *minor)
+@@ -585,6 +647,49 @@ void dsi_link_clk_disable_v2(struct msm_dsi_host *msm_host)
+  *  FIXME: Reconsider this if/when CMD mode handling is rewritten to use
+  *  transfer time and data overhead as a starting point of the calculations.
+  */
++/*
++ * Uncompressed bits per pixel of the source feeding DSC, which is what both the
++ * DSI timing and the byte clock have to be derived against. Upstream hardcodes
++ * 24 in dsi_adjust_pclk_for_compression(), which is only right at 8 bpc: the
++ * MIPI DSI pixel format enum stops at RGB888, so a 10 bpc panel has to report
++ * RGB888 and the pixel clock comes out 20% off.
++ *
++ * Upstream already disagrees with itself about this. dsi_timing_setup() picks
++ * bits_per_pclk for the DSI-side h, and its widebus video-mode branch uses
++ *
++ *	bits_per_pclk = dsc->bits_per_component * 3;
++ *
++ * -- the same quantity, correctly generalised. At 8 bpc both spellings give 24,
++ * which is why nobody has hit it.
++ *
++ * It does NOT depend on the chroma format, even though the vendor's
++ * msm_get_src_bpc() has a table that does (444 -> 3*bpc, 422 -> 2*bpc,
++ * 420 -> 1.5*bpc): that table is reached only from the DATABUS-WIDEN branch of
++ * sde_dsc_populate_dsc_private_params(), and 2*bpc is ruled out by measurement.
++ * On zorn (1440x3200, DSC 1.2 native 4:2:2, 10 bpc, porches 8/8/12 and 16/6/14):
++ *
++ *	3 * bpc = 30:  hdisplay 1440*8/30 = 384, htotal 412
++ *		       pclk 412 * 3236 * 120 = 160.0 MHz, byte 160.0*30/32 = 150.0
++ *		       measured on Arch:  159,987,617 / 149,988,391
++ *		       measured on Android: 160,000,000 / 150,000,000
++ *	2 * bpc = 20:  hdisplay 576, htotal 604, pclk 234.6 MHz, byte 146.6 MHz
++ *
++ * Both clocks land within 0.01% of Android's with 3*bpc and neither does with
++ * 2*bpc. The 2*bpc error had the DPU 46% fast into the DSI; it hid because
++ * byte_clk = pclk * bpp / 32 carries the error in bpp too, so the two partly
++ * cancel and byte_clk looked only 2.3% low.
++ *
++ * This is a different quantity from dsi_timing_setup()'s bits_per_pclk, which in
++ * widebus command mode is 48 and gives the DSI-side h of 1440*8/48 = 240. That
++ * one is how many bytes the bus moves per pclk; this one is how much source
++ * pixel each pclk stands for. Both are in play at once and they do not have to
++ * agree -- 240 pclk of transfer window inside a 412-pclk line is simply slack.
++ */
++static int dsi_dsc_src_bpp(const struct drm_dsc_config *dsc)
++{
++	return dsc->bits_per_component * 3;
++}
++
+ static unsigned long
+ dsi_adjust_pclk_for_compression(const struct drm_display_mode *mode,
+ 				const struct drm_dsc_config *dsc,
+@@ -603,7 +708,7 @@ dsi_adjust_pclk_for_compression(const struct drm_display_mode *mode,
+ 		hdisplay /= 2;
+ 
+ 	new_hdisplay = DIV_ROUND_UP(hdisplay * drm_dsc_get_bpp_int(dsc),
+-				    dsc->bits_per_component * 3);
++				    dsi_dsc_src_bpp(dsc));
+ 
+ 	if (is_bonded_dsi)
+ 		new_hdisplay *= 2;
+@@ -640,10 +745,35 @@ unsigned long dsi_byte_clk_get_rate(struct mipi_dsi_host *host, bool is_bonded_d
+ {
+ 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+ 	u8 lanes = msm_host->lanes;
++	/*
++	 * With DSC, dsi_adjust_pclk_for_compression() has already scaled the pixel
++	 * clock down by compressed_bpp / (bits_per_component * 3), so the byte clock
++	 * has to be scaled back up by that same uncompressed depth.
++	 * mipi_dsi_pixel_format_to_bpp() cannot supply it: the MIPI DSI format enum
++	 * stops at RGB888, so a 10 bpc panel has to report RGB888 and yields 24 where
++	 * the adjustment used 30 -- a byte clock 20% low. On zorn (o11 42 02 0a, DSC
++	 * 1.2, 8 bpp, 10 bpc) that is 960 Mbps/lane against the 1.2 Gbps/lane the
++	 * panel's own device tree asks for. 8 bpc DSC panels are unaffected, which is
++	 * why upstream has not hit this.
++	 *
++	 * Left as a module parameter because on zorn neither rate has produced a
++	 * clean picture yet: 960 Mbps gives an image with periodic corruption bands,
++	 * 1.2 Gbps gives no image at all. Being able to sweep it -- including values
++	 * the format enum could never express -- costs one reboot per try instead of
++	 * a rebuild, via /etc/modprobe.d:
++	 *
++	 *	options msm dsi_dsc_uncompressed_bpp=30
++	 *
++	 * 0 keeps stock upstream behaviour.
++	 */
+ 	u32 bpp = mipi_dsi_pixel_format_to_bpp(msm_host->format);
+ 	unsigned long pclk_rate = dsi_get_pclk_rate(mode, msm_host->dsc, is_bonded_dsi);
+ 	unsigned long pclk_bpp;
+ 
++	if (msm_host->dsc)
++		bpp = dsi_dsc_uncompressed_bpp ? dsi_dsc_uncompressed_bpp
++					       : dsi_dsc_src_bpp(msm_host->dsc);
++
+ 	if (lanes == 0) {
+ 		pr_err("%s: forcing mdss_dsi lanes to 1\n", __func__);
+ 		lanes = 1;
+@@ -913,6 +1043,20 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
+ 		dsi_write(msm_host, REG_DSI_CPHY_MODE_CTRL, BIT(0));
+ }
+ 
++/*
++ * Slices per packet actually in force: the requested value if the slices divide
++ * evenly into the line, otherwise 1. The vendor driver clamps the same way.
++ */
++static u32 dsi_dsc_slice_per_pkt_clamped(const struct drm_dsc_config *dsc)
++{
++	u32 n = dsi_dsc_slice_per_pkt;
++
++	if (!n || n > dsc->slice_count || dsc->slice_count % n)
++		return 1;
++
++	return n;
++}
++
+ static void dsi_update_dsc_timing(struct msm_dsi_host *msm_host, bool is_cmd_mode)
+ {
+ 	struct drm_dsc_config *dsc = msm_host->dsc;
+@@ -921,24 +1065,21 @@ static void dsi_update_dsc_timing(struct msm_dsi_host *msm_host, bool is_cmd_mod
+ 	u32 pkt_per_line;
+ 	u32 eol_byte_num;
+ 	u32 bytes_per_pkt;
++	u32 slice_per_pkt;
+ 
+ 	/* first calculate dsc parameters and then program
+ 	 * compress mode registers
+ 	 */
+ 	slice_per_intf = dsc->slice_count;
+ 
++	slice_per_pkt = dsi_dsc_slice_per_pkt_clamped(dsc);
++
+ 	total_bytes_per_intf = dsc->slice_chunk_size * slice_per_intf;
+-	bytes_per_pkt = dsc->slice_chunk_size; /* * slice_per_pkt; */
++	bytes_per_pkt = dsc->slice_chunk_size * slice_per_pkt;
+ 
+ 	eol_byte_num = total_bytes_per_intf % 3;
+ 
+-	/*
+-	 * Typically, pkt_per_line = slice_per_intf * slice_per_pkt.
+-	 *
+-	 * Since the current driver only supports slice_per_pkt = 1,
+-	 * pkt_per_line will be equal to slice per intf for now.
+-	 */
+-	pkt_per_line = slice_per_intf;
++	pkt_per_line = slice_per_intf / slice_per_pkt;
+ 
+ 	if (is_cmd_mode) /* packet data type */
+ 		reg = DSI_COMMAND_COMPRESSION_MODE_CTRL_STREAM0_DATATYPE(MIPI_DSI_DCS_LONG_WRITE);
+@@ -965,10 +1106,34 @@ static void dsi_update_dsc_timing(struct msm_dsi_host *msm_host, bool is_cmd_mod
+ 		reg_ctrl |= reg;
+ 
+ 		reg_ctrl2 &= ~DSI_COMMAND_COMPRESSION_MODE_CTRL2_STREAM0_SLICE_WIDTH__MASK;
++		/*
++		 * One slice, not one packet: the vendor driver writes bytes_in_slice
++		 * here as well (reg_ctrl2 |= bytes_in_slice << offset). Only the
++		 * packet count and the word count scale with slice_per_pkt.
++		 */
+ 		reg_ctrl2 |= DSI_COMMAND_COMPRESSION_MODE_CTRL2_STREAM0_SLICE_WIDTH(dsc->slice_chunk_size);
+ 
+ 		dsi_write(msm_host, REG_DSI_COMMAND_COMPRESSION_MODE_CTRL, reg_ctrl);
+ 		dsi_write(msm_host, REG_DSI_COMMAND_COMPRESSION_MODE_CTRL2, reg_ctrl2);
++
++		/*
++		 * Read back instead of trusting the computation. STREAM0_PKT_PER_LINE
++		 * (bits 7:6) is the one field where both working references -- the
++		 * bootloader and the vendor kernel -- ask for 0, meaning one packet
++		 * per line with both slices inside it; a wrong value here does not
++		 * show up in the timing. Note the register offsets in this file are
++		 * 4 less than the vendor's, because ctrl_base carries io_offset:
++		 * this is the vendor's DSI_COMMAND_COMPRESSION_MODE_CTRL at +0x2a8.
++		 * Print from the config path rather than reading the register from
++		 * userspace, which hard-resets the SoC once the panel goes idle.
++		 */
++		reg_ctrl = dsi_read(msm_host, REG_DSI_COMMAND_COMPRESSION_MODE_CTRL);
++		reg_ctrl2 = dsi_read(msm_host, REG_DSI_COMMAND_COMPRESSION_MODE_CTRL2);
++		pr_info("msm_dsi: CMPR_MODE_CTRL(hw +0x2a8) %#010x pkt_per_line_field %u eol %u | CTRL2(hw +0x2ac) %#010x slice_width %u | slice_cnt %u chunk %u slice_per_pkt %u pkt_per_line %u bytes_per_pkt %u\n",
++			reg_ctrl, (reg_ctrl >> 6) & 0x3, eol_byte_num,
++			reg_ctrl2, reg_ctrl2 & 0xffff,
++			slice_per_intf, dsc->slice_chunk_size, slice_per_pkt,
++			pkt_per_line, bytes_per_pkt);
+ 	} else {
+ 		reg |= DSI_VIDEO_COMPRESSION_MODE_CTRL_WC(bytes_per_pkt);
+ 		dsi_write(msm_host, REG_DSI_VIDEO_COMPRESSION_MODE_CTRL, reg);
+@@ -1093,13 +1258,15 @@ static void dsi_timing_setup(struct msm_dsi_host *msm_host, bool is_bonded_dsi)
+ 			wc = hdisplay * mipi_dsi_pixel_format_to_bpp(msm_host->format) / 8 + 1;
+ 		else
+ 			/*
+-			 * When DSC is enabled, WC = slice_chunk_size * slice_per_pkt + 1.
+-			 * Currently, the driver only supports default value of slice_per_pkt = 1
+-			 *
+-			 * TODO: Expand mipi_dsi_device struct to hold slice_per_pkt info
+-			 *       and adjust DSC math to account for slice_per_pkt.
++			 * WC = slice_chunk_size * slice_per_pkt + 1. Upstream hardcodes
++			 * slice_per_pkt = 1 here and in dsi_update_dsc_timing(); the
++			 * dsi_dsc_slice_per_pkt parameter drives both, because getting
++			 * only one of them right produces a packet whose declared length
++			 * and whose framing disagree -- which corrupts the whole screen
++			 * rather than just the detailed parts of it.
+ 			 */
+-			wc = msm_host->dsc->slice_chunk_size + 1;
++			wc = msm_host->dsc->slice_chunk_size *
++			     dsi_dsc_slice_per_pkt_clamped(msm_host->dsc) + 1;
+ 
+ 		dsi_write(msm_host, REG_DSI_CMD_MDP_STREAM0_CTRL,
+ 			DSI_CMD_MDP_STREAM0_CTRL_WORD_COUNT(wc) |
+@@ -1111,6 +1278,13 @@ static void dsi_timing_setup(struct msm_dsi_host *msm_host, bool is_bonded_dsi)
+ 		dsi_write(msm_host, REG_DSI_CMD_MDP_STREAM0_TOTAL,
+ 			DSI_CMD_MDP_STREAM0_TOTAL_H_TOTAL(hdisplay) |
+ 			DSI_CMD_MDP_STREAM0_TOTAL_V_TOTAL(mode->vdisplay));
++
++		/* the vendor's DSI_COMMAND_MODE_MDP_STREAM0_CTRL at +0x58 */
++		if (msm_host->dsc)
++			pr_info("msm_dsi: MDP_STREAM0_CTRL(hw +0x58) %#010x word_count %u | TOTAL(hw +0x5c) %#010x h %u v %u\n",
++				dsi_read(msm_host, REG_DSI_CMD_MDP_STREAM0_CTRL), wc,
++				dsi_read(msm_host, REG_DSI_CMD_MDP_STREAM0_TOTAL),
++				hdisplay, mode->vdisplay);
+ 	}
+ }
+ 
+@@ -1836,6 +2010,68 @@ static int dsi_host_parse_lane_data(struct msm_dsi_host *msm_host,
+ 	return -EINVAL;
+ }
+ 
++/*
++ * initial_xmit_delay override, 0 to keep whatever the rate-control table gives.
++ *
++ * The tables derive it from chroma format and bpp, but a panel's own tuning can
++ * differ. The vendor stack hardcodes 256 for this display's panel ID -- see
++ * sde_dsc_helper.c, which patches rc_param_lut->initial_xmit_delay for
++ * O11_PANEL_PA and N11U_PANEL_PA -- where the standard 4:2:2 table says 341.
++ * The difference lands in DSC_HRD_DELAYS and in everything
++ * drm_dsc_compute_rc_parameters() derives from it.
++ */
++static uint dsc_xmit_delay;
++module_param(dsc_xmit_delay, uint, 0600);
++MODULE_PARM_DESC(dsc_xmit_delay,
++		 "override DSC initial_xmit_delay; 0 uses the rate-control table's value");
++
++/*
++ * initial_dec_delay override, 0 to keep the computed value.
++ *
++ * Normally hrd_delay - initial_xmit_delay, but the vendor stack overrides it for
++ * this display's panel ID as well (sde_dsc_helper.c sets 478 for O11_PANEL_PA and
++ * N11U_PANEL_PA). Together with dsc_xmit_delay these are the two halves of
++ * DSC_HRD_DELAYS, so both usually have to be set or neither.
++ */
++static uint dsc_dec_delay;
++module_param(dsc_dec_delay, uint, 0600);
++MODULE_PARM_DESC(dsc_dec_delay,
++		 "override DSC initial_dec_delay; 0 uses the computed value");
++
++/*
++ * DSC 1.2 takes first_line_bpg_offset from the slice height, not from the
++ * rate-control table -- the table entry is the DSC 1.1 legacy constant. For a
++ * 4:2:2 stream the table says 15 while a 20-line slice wants 13.
++ *
++ * Transcribed from the vendor stack's _get_dsc_v1_2_bpg_offset().
++ */
++static u8 dsi_dsc_v1_2_bpg_offset(const struct drm_dsc_config *dsc)
++{
++	u8 bpp = dsc->bits_per_pixel >> 4;
++	u8 uncompressed_bpg_rate;
++	u8 bpg_offset;
++
++	if (dsc->slice_height < 8)
++		bpg_offset = 2 * (dsc->slice_height - 1);
++	else if (dsc->slice_height < 20)
++		bpg_offset = 12;
++	else if (dsc->slice_height <= 30)
++		bpg_offset = 13;
++	else if (dsc->slice_height < 42)
++		bpg_offset = 14;
++	else
++		bpg_offset = 15;
++
++	if (dsc->native_422)
++		uncompressed_bpg_rate = 3 * bpp * 4;
++	else if (dsc->native_420)
++		uncompressed_bpg_rate = 3 * bpp;
++	else
++		uncompressed_bpg_rate = (3 * bpp + 2) * 3;
++
++	return min_t(u8, bpg_offset, uncompressed_bpg_rate - 3 * bpp);
++}
++
+ static int dsi_populate_dsc_params(struct msm_dsi_host *msm_host, struct drm_dsc_config *dsc)
+ {
+ 	int ret;
+@@ -1863,14 +2099,41 @@ static int dsi_populate_dsc_params(struct msm_dsi_host *msm_host, struct drm_dsc
+ 	}
+ 
+ 	dsc->simple_422 = 0;
+-	dsc->convert_rgb = 1;
++	/*
++	 * convert_rgb asks DSC to do the RGB -> YCoCg transform itself, which only
++	 * makes sense for a 4:4:4 RGB source. A native 4:2:2 or 4:2:0 source
++	 * arrives as YCbCr with the chroma already subsampled, so upstream's
++	 * derivation makes the two mutually exclusive -- and that is what the
++	 * vendor programs too. But the vendor's DPU never runs a CDM on the DSI
++	 * path, so nothing on either stack actually converts RGB to YCbCr before
++	 * DSC; see the parameter's comment. Overridable because the measured
++	 * failure (chroma at the wrong scale, structure perfect) is exactly what a
++	 * missing forward transform looks like.
++	 */
++	if (dsc_convert_rgb <= 1)
++		dsc->convert_rgb = dsc_convert_rgb;
++	else
++		dsc->convert_rgb = !dsc->native_422 && !dsc->native_420;
+ 	dsc->vbr_enable = 0;
+ 
+ 	drm_dsc_set_const_params(dsc);
+ 	drm_dsc_set_rc_buf_thresh(dsc);
+ 
+-	/* DPU supports only pre-SCR panels */
+-	ret = drm_dsc_setup_rc_params(dsc, DRM_DSC_1_1_PRE_SCR);
++	/*
++	 * Pick the rate-control table that matches the chroma format. The pre-SCR
++	 * set is DSC 1.1 legacy and only describes 4:4:4; a native 4:2:2 stream has
++	 * its own initial_xmit_delay, initial_offset and rc_range_params, and
++	 * feeding it the 4:4:4 numbers leaves the decoder's rate control out of
++	 * step with the encoder -- the picture breaks up even though every field
++	 * the driver sets explicitly looks correct.
++	 *
++	 * DPU supports only pre-SCR panels, which is why 4:4:4 uses that table
++	 * rather than DRM_DSC_1_2_444.
++	 */
++	if (dsc->native_422)
++		ret = drm_dsc_setup_rc_params(dsc, DRM_DSC_1_2_422);
++	else
++		ret = drm_dsc_setup_rc_params(dsc, DRM_DSC_1_1_PRE_SCR);
+ 	if (ret) {
+ 		DRM_DEV_ERROR(&msm_host->pdev->dev, "could not find DSC RC parameters\n");
+ 		return ret;
+@@ -1879,7 +2142,26 @@ static int dsi_populate_dsc_params(struct msm_dsi_host *msm_host, struct drm_dsc
+ 	dsc->initial_scale_value = drm_dsc_initial_scale_value(dsc);
+ 	dsc->line_buf_depth = dsc->bits_per_component + 1;
+ 
+-	return drm_dsc_compute_rc_parameters(dsc);
++	/*
++	 * Both of these have to land after setup_rc_params, which sets them from
++	 * the table, and before compute_rc_parameters, which derives hrd_delay,
++	 * the scale intervals and the bpg offsets from them.
++	 */
++	if (dsc->dsc_version_minor == 0x2)
++		dsc->first_line_bpg_offset = dsi_dsc_v1_2_bpg_offset(dsc);
++
++	if (dsc_xmit_delay)
++		dsc->initial_xmit_delay = dsc_xmit_delay;
++
++	ret = drm_dsc_compute_rc_parameters(dsc);
++	if (ret)
++		return ret;
++
++	/* after compute_rc_parameters, which is what derives initial_dec_delay */
++	if (dsc_dec_delay)
++		dsc->initial_dec_delay = dsc_dec_delay;
++
++	return 0;
+ }
+ 
+ static int dsi_host_parse_dt(struct msm_dsi_host *msm_host)
+diff --git a/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c b/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
+index 01182442d..2491d6a3d 100644
+--- a/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
++++ b/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
+@@ -38,6 +38,39 @@
+  *                                                  dsi0_pll_post_out_div_clk
+  */
+ 
++/*
++ * Override the 14 CMN_TIMING_CTRL registers with values supplied by hand.
++ *
++ * mainline computes D-PHY timings from the bit clock. Vendor device trees instead
++ * ship a measured set -- zorn's panel has
++ *
++ *	qcom,mdss-dsi-panel-phy-timings = [00 27 0A 0A 1B 19 0A 0B 0A 02 04 00 20 0F];
++ *
++ * which is 0 39 10 10 27 25 10 11 10 2 4 0 32 15, i.e. exactly these fourteen
++ * registers in order: positions 0, 9, 10 and 11 hold 0, 2, 4, 0, the same
++ * constants the code below writes literally, which is what confirms the mapping.
++ *
++ * Worth having because the remaining corruption on this panel is
++ * content-dependent -- flat colour is perfect, dense text bands once per DSC
++ * slice row -- and that is what a marginal high-speed link looks like:
++ * compressed detail is high-entropy and stresses the PHY, compressed flat colour
++ * does not, and one bit error ruins the slice it lands in. Every DSC parameter
++ * and both link rates have already been ruled out.
++ *
++ *	echo 0,39,10,10,27,25,10,11,10,2,4,0,32,15 > \
++ *		/sys/module/msm/parameters/dsi_phy_timing
++ *	echo 1 > /sys/class/graphics/fb0/blank; sleep 2
++ *	echo 0 > /sys/class/graphics/fb0/blank
++ *
++ * Fewer than 14 values = use the computed timings.
++ */
++static u8 dsi_phy_timing[14];
++static int dsi_phy_timing_count;
++module_param_array_named(dsi_phy_timing, dsi_phy_timing, byte,
++			 &dsi_phy_timing_count, 0600);
++MODULE_PARM_DESC(dsi_phy_timing,
++		 "14 raw CMN_TIMING_CTRL_0..13 values (default: computed)");
++
+ #define VCO_REF_CLK_RATE		19200000
+ #define FRAC_BITS 18
+ 
+@@ -1156,6 +1189,13 @@ static int dsi_7nm_phy_enable(struct msm_dsi_phy *phy,
+ 		writel(0x02, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_9);
+ 		writel(0x04, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_10);
+ 		writel(0x00, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_11);
++	} else if (dsi_phy_timing_count == ARRAY_SIZE(dsi_phy_timing)) {
++		int i;
++
++		DBG("DSI%d using supplied PHY timings", phy->id);
++		for (i = 0; i < ARRAY_SIZE(dsi_phy_timing); i++)
++			writel(dsi_phy_timing[i],
++			       base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_0 + 4 * i);
+ 	} else {
+ 		writel(0x00, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_0);
+ 		writel(timing->clk_zero, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_1);

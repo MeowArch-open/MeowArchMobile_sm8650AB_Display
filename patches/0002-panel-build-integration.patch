@@ -1,0 +1,33 @@
+diff --git a/drivers/gpu/drm/panel/Kconfig b/drivers/gpu/drm/panel/Kconfig
+index 79264f7bb..de67c9d79 100644
+--- a/drivers/gpu/drm/panel/Kconfig
++++ b/drivers/gpu/drm/panel/Kconfig
+@@ -1196,6 +1196,16 @@ config DRM_PANEL_VISIONOX_RM692E5
+ 	  display panels, such as the one found in the Nothing Phone (1)
+ 	  smartphone.
+ 
++config DRM_PANEL_XIAOMI_O11_42_02_0A
++	tristate "Xiaomi o11 42 02 0a 1440x3200 DSC command mode panel"
++	depends on OF
++	depends on DRM_MIPI_DSI
++	depends on BACKLIGHT_CLASS_DEVICE
++	help
++	  Say Y here if you want to enable support for the Xiaomi
++	  "o11 42 02 0a" 1440x3200 DSC 1.2 command mode AMOLED panel, as
++	  fitted to the Redmi K80 (zorn, SM8650).
++
+ config DRM_PANEL_VISIONOX_VTDR6130
+ 	tristate "Visionox VTDR6130"
+ 	depends on OF
+diff --git a/drivers/gpu/drm/panel/Makefile b/drivers/gpu/drm/panel/Makefile
+index aeffaa956..c3aa728cf 100644
+--- a/drivers/gpu/drm/panel/Makefile
++++ b/drivers/gpu/drm/panel/Makefile
+@@ -117,6 +117,7 @@ obj-$(CONFIG_DRM_PANEL_TRULY_NT35597_WQXGA) += panel-truly-nt35597.o
+ obj-$(CONFIG_DRM_PANEL_VISIONOX_G2647FB105) += panel-visionox-g2647fb105.o
+ obj-$(CONFIG_DRM_PANEL_VISIONOX_RM69299) += panel-visionox-rm69299.o
+ obj-$(CONFIG_DRM_PANEL_VISIONOX_RM692E5) += panel-visionox-rm692e5.o
++obj-$(CONFIG_DRM_PANEL_XIAOMI_O11_42_02_0A) += panel-xiaomi-o11-42-02-0a.o
+ obj-$(CONFIG_DRM_PANEL_VISIONOX_VTDR6130) += panel-visionox-vtdr6130.o
+ obj-$(CONFIG_DRM_PANEL_VISIONOX_R66451) += panel-visionox-r66451.o
+ obj-$(CONFIG_DRM_PANEL_WIDECHIPS_WS2401) += panel-widechips-ws2401.o

@@ -1,0 +1,18 @@
+[Unit]
+Description=Dump the state of the display stack to /var/log/zorn-display.txt
+Documentation=man:zorn-display-probe(nonexistent)
+After=multi-user.target systemd-modules-load.service
+Wants=multi-user.target
+
+[Service]
+Type=oneshot
+# 45 s is past deferred_probe_timeout=30, so the display stack has finished
+# succeeding or failing by the time this looks at it.
+ExecStartPre=/usr/bin/sleep 45
+ExecStart=/usr/local/bin/zorn-display-probe.sh
+RemainAfterExit=yes
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

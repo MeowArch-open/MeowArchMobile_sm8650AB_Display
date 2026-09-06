@@ -1,0 +1,15 @@
+[Unit]
+Description=Cycle DPMS once so the o11 panel actually starts displaying
+After=systemd-modules-load.service
+Before=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/zorn-display-kick.sh
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
