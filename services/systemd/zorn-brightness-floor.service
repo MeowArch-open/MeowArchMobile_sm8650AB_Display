@@ -1,0 +1,15 @@
+[Unit]
+Description=Clamp panel backlight to a minimum brightness (never let it go black)
+After=zorn-display-kick.service
+
+[Service]
+Type=simple
+# Change the floor here (raw units, max 16383) and restart the service.
+Environment=BL_FLOOR=165
+ExecStart=/usr/local/bin/zorn-brightness-floor.sh
+Restart=always
+RestartSec=2
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

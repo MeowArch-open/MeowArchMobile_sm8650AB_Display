@@ -1,0 +1,4 @@
+# powerdevil / the brightness slider can drive this AMOLED's backlight to 0,
+# which is indistinguishable from a dead panel. zorn-brightness-floor.service
+# polls the sysfs backlight and clamps it to a floor; this line enables it.
+zorn-brightness-floor.service
